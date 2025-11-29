@@ -46,10 +46,11 @@ type Trade struct {
 
 var (
 	mu           sync.RWMutex
-	users        = make(map[string]User)
-	tokens       = make(map[string]string)
-	orders       = make(map[string]*Order)
-	trades       = make([]*Trade, 0)
+	users              = make(map[string]User)
+	tokens             = make(map[string]string)
+	dnaSamples         = make(map[string][]string)
+	orders             = make(map[string]*Order)
+	trades             = make([]*Trade, 0)
 	orderCounter int64 = 0
 )
 
@@ -349,6 +350,126 @@ func getUserFromToken(r *http.Request) (string, bool) {
 	return user, ok
 }
 
+func validateDNASample(s string) bool {
+	if s == "" || len(s)%3 != 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case 'C', 'G', 'A', 'T':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func splitCodons(s string) []string {
+	codons := make([]string, 0, len(s)/3)
+	for i := 0; i < len(s); i += 3 {
+		codons = append(codons, s[i:i+3])
+	}
+	return codons
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func codonEditDistanceBounded(a, b []string, limit int) int {
+	m := len(a)
+	n := len(b)
+	if limit < 0 {
+		limit = 0
+	}
+	if absInt(m-n) > limit {
+		return limit + 1
+	}
+	if limit == 0 {
+		if m != n {
+			return limit + 1
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				return limit + 1
+			}
+		}
+		return 0
+	}
+
+	inf := limit + 1
+	prev := make(map[int]int, 2*limit+2)
+	for j := 0; j <= n && j <= limit; j++ {
+		prev[j] = j
+	}
+
+	for i := 1; i <= m; i++ {
+		curr := make(map[int]int, 2*limit+2)
+		startJ := i - limit
+		if startJ < 0 {
+			startJ = 0
+		}
+		endJ := i + limit
+		if endJ > n {
+			endJ = n
+		}
+
+		for j := startJ; j <= endJ; j++ {
+			del := inf
+			if v, ok := prev[j]; ok {
+				del = v + 1
+			}
+			ins := inf
+			if v, ok := curr[j-1]; ok {
+				ins = v + 1
+			}
+			sub := inf
+			if j > 0 {
+				if v, ok := prev[j-1]; ok {
+					sub = v
+					if a[i-1] != b[j-1] {
+						sub++
+					}
+				}
+			}
+
+			val := del
+			if ins < val {
+				val = ins
+			}
+			if sub < val {
+				val = sub
+			}
+			if val <= limit {
+				curr[j] = val
+			}
+		}
+
+		if len(curr) == 0 {
+			return limit + 1
+		}
+
+		minRow := inf
+		for _, v := range curr {
+			if v < minRow {
+				minRow = v
+			}
+		}
+		if minRow > limit {
+			return limit + 1
+		}
+		prev = curr
+	}
+
+	if v, ok := prev[n]; ok && v <= limit {
+		return v
+	}
+	return limit + 1
+}
+
 // --- HTTP Handlers ---
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -444,6 +565,113 @@ func passwordHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func dnaSubmitHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	data, err := DecodeMessage(r.Body)
+	if err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	username, okU := data["username"].(string)
+	password, okP := data["password"].(string)
+	dna, okD := data["dna_sample"].(string)
+	if !okU || !okP || !okD || username == "" || password == "" {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	if !validateDNASample(dna) {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	u, exists := users[username]
+	if !exists || u.Password != password {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	existing := dnaSamples[username]
+	for _, sample := range existing {
+		if sample == dna {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
+	dnaSamples[username] = append(existing, dna)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func dnaLoginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	data, err := DecodeMessage(r.Body)
+	if err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	username, okU := data["username"].(string)
+	dna, okD := data["dna_sample"].(string)
+	if !okU || !okD || username == "" || dna == "" {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	if !validateDNASample(dna) {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	submittedCodons := splitCodons(dna)
+
+	mu.RLock()
+	_, userExists := users[username]
+	samples := dnaSamples[username]
+	mu.RUnlock()
+
+	if !userExists || len(samples) == 0 {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	matched := false
+	for _, ref := range samples {
+		refCodons := splitCodons(ref)
+		allowed := len(refCodons) / 100000
+		dist := codonEditDistanceBounded(refCodons, submittedCodons, allowed)
+		if dist <= allowed {
+			matched = true
+			break
+		}
+	}
+
+	if !matched {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	token := generateToken()
+	mu.Lock()
+	tokens[token] = username
+	mu.Unlock()
+
+	resp := map[string]GValue{"token": token}
+	encoded, _ := EncodeMessage(resp)
+	w.Header().Set("Content-Type", "application/x-galacticbuf")
+	w.Write(encoded)
 }
 
 // V1 Orders Handler (V1 List & V1 Submit)
@@ -556,7 +784,7 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 
 // V2 Orders Handler (V2 Order Book & V2 Submit)
 func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
-	
+
 	// GET /v2/orders (ORDER BOOK - Public)
 	if r.Method == http.MethodGet {
 		q := r.URL.Query()
@@ -574,11 +802,16 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid timestamps", http.StatusBadRequest)
 			return
 		}
-		
+		const hourMs = 3600000
+		if start%hourMs != 0 || end%hourMs != 0 || end <= start || (end-start) != hourMs {
+			http.Error(w, "Invalid Contract Timestamps", http.StatusBadRequest)
+			return
+		}
+
 		mu.RLock()
 		var bids []*Order
 		var asks []*Order
-		
+
 		for _, o := range orders {
 			// Filters: V2, OPEN, Match Contract
 			if o.Version == 2 && o.Status == "OPEN" && o.DeliveryStart == start && o.DeliveryEnd == end {
@@ -592,7 +825,7 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		mu.RUnlock()
 
 		// --- Sorting ---
-		
+
 		// Bids: Price DESC (Highest First), then Time ASC (Oldest First)
 		sort.Slice(bids, func(i, j int) bool {
 			if bids[i].Price != bids[j].Price {
@@ -600,7 +833,7 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 			}
 			return bids[i].Timestamp < bids[j].Timestamp // Oldest time first
 		})
-		
+
 		// Asks: Price ASC (Lowest First), then Time ASC (Oldest First)
 		sort.Slice(asks, func(i, j int) bool {
 			if asks[i].Price != asks[j].Price {
@@ -610,7 +843,7 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		})
 
 		// --- Response Construction ---
-		
+
 		bidsList := make([]map[string]GValue, 0, len(bids))
 		for _, o := range bids {
 			bidsList = append(bidsList, map[string]GValue{
@@ -628,7 +861,7 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 				"quantity": o.Quantity,
 			})
 		}
-		
+
 		resp := map[string]GValue{
 			"bids": bidsList,
 			"asks": asksList,
@@ -683,7 +916,7 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		orderCounter++
 		orderID := fmt.Sprintf("ord-v2-%d", orderCounter)
 		now := time.Now().UnixMilli()
-		
+
 		// Track filled quantity for the incoming order
 		remainingQty := quantity
 		var filledQty int64 = 0
@@ -803,7 +1036,7 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		w.Write(encoded)
 		return
 	}
-	
+
 	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 }
 
@@ -914,10 +1147,10 @@ func tradesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		order.Status = "FILLED"
-		
+
 		now := time.Now().UnixMilli()
 		tradeID := fmt.Sprintf("trd-%s-%d", order.ID, now)
-		
+
 		newTrade := &Trade{
 			ID:        tradeID,
 			BuyerID:   buyerUser,
@@ -944,16 +1177,18 @@ func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 func main() {
 	mux := http.NewServeMux()
-	
+
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/register", registerHandler)
 	mux.HandleFunc("/login", loginHandler)
 	mux.HandleFunc("/user/password", passwordHandler)
-	
+	mux.HandleFunc("/dna-submit", dnaSubmitHandler)
+	mux.HandleFunc("/dna-login", dnaLoginHandler)
+
 	mux.HandleFunc("/orders", ordersV1Handler)
 	mux.HandleFunc("/v2/orders", ordersV2Handler)
 	mux.HandleFunc("/v2/my-orders", myOrdersHandler)
-	
+
 	mux.HandleFunc("/trades", tradesHandler)
 
 	log.Println("Galactic Exchange started on :8080")
