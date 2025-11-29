@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -11,23 +13,34 @@ import (
 	"time"
 )
 
-// --- Хранилище данных (In-Memory Database) ---
-// В реальности здесь была бы БД, но для хакатона хватит мапы с мьютексом.
+// --- In-Memory Database ---
+
+type User struct {
+	Username string
+	Password string
+}
+
 type Order struct {
-	ID     string
-	Price  int64
-	Status string // "OPEN", "FILLED"
+	ID            string
+	Price         int64
+	Quantity      int64
+	DeliveryStart int64
+	DeliveryEnd   int64
+	Owner         string // Username
+	Status        string // "OPEN", "FILLED"
 }
 
 var (
-	ordersMutex sync.RWMutex
-	orders      = map[string]*Order{
-		// Добавим тестовый ордер, чтобы можно было проверить
-		"order_123": {ID: "order_123", Price: 500, Status: "OPEN"},
-	}
+	mu      sync.RWMutex
+	users   = make(map[string]User)   // Username -> User
+	tokens  = make(map[string]string) // Token -> Username
+	orders  = make(map[string]*Order) // ID -> Order
+	// Для генерации ID
+	orderCounter int64 = 0
 )
 
-// --- GalacticBuf Constants ---
+// --- GalacticBuf Protocol Implementation ---
+
 const (
 	TypeInt    = 0x01
 	TypeString = 0x02
@@ -35,32 +48,20 @@ const (
 	TypeObject = 0x04
 )
 
-// --- GalacticBuf Serialization Logic ---
-
-// GValue - универсальная обертка для значений
 type GValue interface{}
 
-// EncodeMessage создает полное сообщение GalacticBuf (Header + Fields)
+// EncodeMessage converts a map to GalacticBuf bytes
 func EncodeMessage(data map[string]GValue) ([]byte, error) {
 	bodyBuffer := new(bytes.Buffer)
-	
-	// Пишем поля (Field Count будет вычислен из длины мапы)
 	if err := writeFields(bodyBuffer, data); err != nil {
 		return nil, err
 	}
 	bodyBytes := bodyBuffer.Bytes()
 
-	// Создаем заголовок
 	header := new(bytes.Buffer)
-	// Byte 0: Version
-	header.WriteByte(0x01)
-	// Byte 1: Field Count
-	header.WriteByte(byte(len(data)))
-	// Bytes 2-3: Total Length (Header 4 bytes + Body length)
+	header.WriteByte(0x01)            // Version
+	header.WriteByte(byte(len(data))) // Field Count
 	totalLen := 4 + len(bodyBytes)
-	if totalLen > 65535 {
-		return nil, fmt.Errorf("message too large")
-	}
 	binary.Write(header, binary.BigEndian, uint16(totalLen))
 
 	return append(header.Bytes(), bodyBytes...), nil
@@ -68,20 +69,19 @@ func EncodeMessage(data map[string]GValue) ([]byte, error) {
 
 func writeFields(buf *bytes.Buffer, data map[string]GValue) error {
 	for name, val := range data {
-		// 1. Field Name Length
+		// Field Name Length
 		if len(name) > 255 {
 			return fmt.Errorf("field name too long")
 		}
 		buf.WriteByte(byte(len(name)))
-		// 2. Field Name
+		// Field Name
 		buf.WriteString(name)
 
-		// 3. Type & 4. Value
 		switch v := val.(type) {
 		case int64:
 			buf.WriteByte(TypeInt)
 			binary.Write(buf, binary.BigEndian, v)
-		case int: // Helper for literals
+		case int:
 			buf.WriteByte(TypeInt)
 			binary.Write(buf, binary.BigEndian, int64(v))
 		case string:
@@ -91,8 +91,16 @@ func writeFields(buf *bytes.Buffer, data map[string]GValue) error {
 			}
 			binary.Write(buf, binary.BigEndian, uint16(len(v)))
 			buf.WriteString(v)
-		// Для простоты задачи List и Object здесь опущены в Encod'ере (для ответа нам нужны только String trade_id),
-		// но если нужно отправлять списки, логика аналогична Decoder'у ниже.
+		case []map[string]GValue: // List of Objects
+			buf.WriteByte(TypeList)
+			buf.WriteByte(TypeObject)                           // Element Type
+			binary.Write(buf, binary.BigEndian, uint16(len(v))) // Element Count
+			for _, obj := range v {
+				buf.WriteByte(byte(len(obj))) // Field count for object
+				if err := writeFields(buf, obj); err != nil {
+					return err
+				}
+			}
 		default:
 			return fmt.Errorf("unsupported type for encoding: %T", v)
 		}
@@ -100,47 +108,39 @@ func writeFields(buf *bytes.Buffer, data map[string]GValue) error {
 	return nil
 }
 
-// DecodeMessage парсит входящие байты в мапу
+// DecodeMessage parses GalacticBuf bytes to a map
 func DecodeMessage(r io.Reader) (map[string]GValue, error) {
-	// 1. Read Header (4 bytes)
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(r, header); err != nil {
 		return nil, err
 	}
-
 	if header[0] != 0x01 {
 		return nil, fmt.Errorf("invalid protocol version")
 	}
 	fieldCount := int(header[1])
-	// Total length нам не особо нужен для стримингового чтения, но можно проверить
-	
 	return readFields(r, fieldCount)
 }
 
 func readFields(r io.Reader, count int) (map[string]GValue, error) {
 	result := make(map[string]GValue)
-	
 	for i := 0; i < count; i++ {
-		// a. Name Length
+		// Name Len
 		var nameLen uint8
 		if err := binary.Read(r, binary.BigEndian, &nameLen); err != nil {
 			return nil, err
 		}
-		
-		// b. Name
+		// Name
 		nameBytes := make([]byte, nameLen)
 		if _, err := io.ReadFull(r, nameBytes); err != nil {
 			return nil, err
 		}
 		fieldName := string(nameBytes)
-
-		// c. Type Indicator
+		// Type
 		var typeInd uint8
 		if err := binary.Read(r, binary.BigEndian, &typeInd); err != nil {
 			return nil, err
 		}
-
-		// d. Value
+		// Value
 		val, err := readValue(r, typeInd)
 		if err != nil {
 			return nil, err
@@ -159,132 +159,299 @@ func readValue(r io.Reader, typeInd uint8) (GValue, error) {
 		}
 		return v, nil
 	case TypeString:
-		var strLen uint16
-		if err := binary.Read(r, binary.BigEndian, &strLen); err != nil {
+		var l uint16
+		if err := binary.Read(r, binary.BigEndian, &l); err != nil {
 			return nil, err
 		}
-		strBytes := make([]byte, strLen)
-		if _, err := io.ReadFull(r, strBytes); err != nil {
+		buf := make([]byte, l)
+		if _, err := io.ReadFull(r, buf); err != nil {
 			return nil, err
 		}
-		return string(strBytes), nil
+		return string(buf), nil
 	case TypeList:
 		var elemType uint8
-		if err := binary.Read(r, binary.BigEndian, &elemType); err != nil {
-			return nil, err
-		}
-		var elemCount uint16
-		if err := binary.Read(r, binary.BigEndian, &elemCount); err != nil {
-			return nil, err
-		}
-		list := make([]GValue, 0, elemCount)
-		for k := 0; k < int(elemCount); k++ {
+		binary.Read(r, binary.BigEndian, &elemType)
+		var count uint16
+		binary.Read(r, binary.BigEndian, &count)
+		list := make([]GValue, 0, count)
+		for k := 0; k < int(count); k++ {
 			if elemType == TypeObject {
-				// Object in list has no outer header, just field count + fields
-				var fieldCount uint8
-				if err := binary.Read(r, binary.BigEndian, &fieldCount); err != nil {
-					return nil, err
-				}
-				obj, err := readFields(r, int(fieldCount))
-				if err != nil {
-					return nil, err
-				}
+				var fc uint8
+				binary.Read(r, binary.BigEndian, &fc)
+				obj, _ := readFields(r, int(fc))
 				list = append(list, obj)
 			} else {
-				v, err := readValue(r, elemType)
-				if err != nil {
-					return nil, err
-				}
+				v, _ := readValue(r, elemType)
 				list = append(list, v)
 			}
 		}
 		return list, nil
 	case TypeObject:
-		var fieldCount uint8
-		if err := binary.Read(r, binary.BigEndian, &fieldCount); err != nil {
-			return nil, err
-		}
-		return readFields(r, int(fieldCount))
+		var fc uint8
+		binary.Read(r, binary.BigEndian, &fc)
+		return readFields(r, int(fc))
 	default:
-		return nil, fmt.Errorf("unknown type: %x", typeInd)
+		return nil, fmt.Errorf("unknown type %x", typeInd)
 	}
+}
+
+// --- Helpers ---
+
+func generateToken() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 // --- HTTP Handlers ---
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
 }
 
-func tradesHandler(w http.ResponseWriter, r *http.Request) {
-	// 1. Auth Check (Prerequisite)
-	// Простейшая проверка наличия заголовка Authorization
-	if r.Header.Get("Authorization") == "" {
+// POST /register
+func registerHandler(w http.ResponseWriter, r *http.Request) {
+	data, err := DecodeMessage(r.Body)
+	if err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	username, _ := data["username"].(string)
+	password, _ := data["password"].(string)
+
+	if username == "" || password == "" {
+		http.Error(w, "Empty fields", http.StatusBadRequest)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if _, exists := users[username]; exists {
+		http.Error(w, "Conflict", http.StatusConflict)
+		return
+	}
+
+	users[username] = User{Username: username, Password: password}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// POST /login
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	data, err := DecodeMessage(r.Body)
+	if err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	username, _ := data["username"].(string)
+	password, _ := data["password"].(string)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	u, exists := users[username]
+	if !exists || u.Password != password {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	// 2. Читаем тело запроса (GalacticBuf)
-	data, err := DecodeMessage(r.Body)
-	if err != nil {
-		log.Printf("Decode error: %v", err)
-		http.Error(w, "Bad Request: Invalid GalacticBuf", http.StatusBadRequest)
+	token := generateToken()
+	tokens[token] = username
+
+	resp := map[string]GValue{"token": token}
+	encoded, _ := EncodeMessage(resp)
+	w.Header().Set("Content-Type", "application/x-galacticbuf")
+	w.Write(encoded)
+}
+
+// POST /orders (Submit Orders)
+// GET /orders (List Orders - assumed requirement)
+func ordersHandler(w http.ResponseWriter, r *http.Request) {
+	// 1. Authentication Check
+	authHeader := r.Header.Get("Authorization")
+	if len(authHeader) < 7 || authHeader[:7] != "Bearer " {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	token := authHeader[7:]
+
+	mu.RLock()
+	username, authOk := tokens[token]
+	mu.RUnlock()
+
+	if !authOk {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	// 3. Извлекаем order_id
-	orderIDVal, ok := data["order_id"]
-	if !ok {
-		http.Error(w, "Bad Request: missing order_id", http.StatusBadRequest)
+	if r.Method == http.MethodPost {
+		// SUBMIT ORDER
+		data, err := DecodeMessage(r.Body)
+		if err != nil {
+			log.Printf("Order decode error: %v", err)
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+
+		// Extract and Validate Fields
+		price, ok1 := data["price"].(int64)
+		quantity, ok2 := data["quantity"].(int64)
+		start, ok3 := data["delivery_start"].(int64)
+		end, ok4 := data["delivery_end"].(int64)
+
+		if !ok1 || !ok2 || !ok3 || !ok4 {
+			http.Error(w, "Missing/Invalid fields", http.StatusBadRequest)
+			return
+		}
+
+		// Logic Validation
+		// 1. Quantity must be positive
+		if quantity <= 0 {
+			http.Error(w, "Quantity must be positive", http.StatusBadRequest)
+			return
+		}
+		// 2. Timestamps aligned to 1-hour boundaries (3600000 ms)
+		const hourMs = 3600000
+		if start%hourMs != 0 || end%hourMs != 0 {
+			http.Error(w, "Timestamps not aligned", http.StatusBadRequest)
+			return
+		}
+		// 3. End > Start
+		if end <= start {
+			http.Error(w, "End must be > Start", http.StatusBadRequest)
+			return
+		}
+		// 4. Duration exactly 1 hour
+		if (end - start) != hourMs {
+			http.Error(w, "Duration must be 1 hour", http.StatusBadRequest)
+			return
+		}
+
+		// Create Order
+		mu.Lock()
+		orderCounter++
+		orderID := fmt.Sprintf("ord-%d-%s", orderCounter, username)
+		newOrder := &Order{
+			ID:            orderID,
+			Price:         price,
+			Quantity:      quantity,
+			DeliveryStart: start,
+			DeliveryEnd:   end,
+			Owner:         username,
+			Status:        "OPEN",
+		}
+		orders[orderID] = newOrder
+		mu.Unlock()
+
+		// Response
+		resp := map[string]GValue{"order_id": orderID}
+		encoded, _ := EncodeMessage(resp)
+		w.Header().Set("Content-Type", "application/x-galacticbuf")
+		w.Write(encoded)
 		return
 	}
-	orderID, ok := orderIDVal.(string)
-	if !ok {
-		http.Error(w, "Bad Request: order_id must be string", http.StatusBadRequest)
+
+	if r.Method == http.MethodGet {
+		// LIST ORDERS (Simple implementation)
+		mu.RLock()
+		defer mu.RUnlock()
+		
+		// Typically list orders returns a list of objects
+		list := make([]map[string]GValue, 0)
+		for _, o := range orders {
+			if o.Status == "OPEN" {
+				list = append(list, map[string]GValue{
+					"id":             o.ID,
+					"price":          o.Price,
+					"quantity":       o.Quantity,
+					"delivery_start": o.DeliveryStart,
+					"delivery_end":   o.DeliveryEnd,
+				})
+			}
+		}
+		resp := map[string]GValue{"orders": list}
+		encoded, _ := EncodeMessage(resp)
+		w.Header().Set("Content-Type", "application/x-galacticbuf")
+		w.Write(encoded)
+	}
+}
+
+// POST /trades (Take Order) - from previous context
+func tradesHandler(w http.ResponseWriter, r *http.Request) {
+	// Auth check
+	authHeader := r.Header.Get("Authorization")
+	if len(authHeader) < 7 || authHeader[:7] != "Bearer " {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	token := authHeader[7:]
+	mu.RLock()
+	_, authOk := tokens[token]
+	mu.RUnlock()
+	if !authOk {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	// 4. Логика сделки
-	ordersMutex.Lock()
-	order, exists := orders[orderID]
-	
-	if !exists || order.Status != "OPEN" {
-		ordersMutex.Unlock()
-		http.Error(w, "Order not found or not active", http.StatusNotFound)
-		return
+	if r.Method == http.MethodPost {
+		data, err := DecodeMessage(r.Body)
+		if err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+
+		orderID, ok := data["order_id"].(string)
+		if !ok {
+			http.Error(w, "Missing order_id", http.StatusBadRequest)
+			return
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		order, exists := orders[orderID]
+		if !exists || order.Status != "OPEN" {
+			http.Error(w, "Order not found/filled", http.StatusNotFound)
+			return
+		}
+
+		order.Status = "FILLED"
+		tradeID := fmt.Sprintf("trd-%d", time.Now().UnixNano())
+
+		resp := map[string]GValue{"trade_id": tradeID}
+		encoded, _ := EncodeMessage(resp)
+		w.Header().Set("Content-Type", "application/x-galacticbuf")
+		w.Write(encoded)
 	}
+}
 
-	// "Fill" the order
-	order.Status = "FILLED"
-	ordersMutex.Unlock()
-
-	// Генерируем trade_id
-	tradeID := fmt.Sprintf("trade_%d_%s", time.Now().Unix(), orderID)
-
-	// 5. Формируем ответ (GalacticBuf)
-	responseData := map[string]GValue{
-		"trade_id": tradeID,
+// Middleware to log requests (helps debug)
+func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewBuffer(body))
+		
+		log.Printf("REQ: %s %s", r.Method, r.URL.Path)
+		if len(body) > 0 {
+			log.Printf("BODY (Hex): %s", hex.EncodeToString(body))
+		}
+		next(w, r)
 	}
-	
-	encodedResp, err := EncodeMessage(responseData)
-	if err != nil {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.WriteHeader(http.StatusOK)
-	w.Write(encodedResp)
 }
 
 func main() {
-	http.HandleFunc("/health", healthHandler)
-	http.HandleFunc("/trades", tradesHandler)
+	mux := http.NewServeMux()
+	
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/register", registerHandler)
+	mux.HandleFunc("/login", loginHandler)
+	mux.HandleFunc("/orders", ordersHandler)
+	mux.HandleFunc("/trades", tradesHandler)
 
-	port := ":8080"
-	log.Printf("Galactic Exchange listening on %s", port)
-	if err := http.ListenAndServe(port, nil); err != nil {
+	log.Println("Galactic Exchange started on :8080")
+	if err := http.ListenAndServe(":8080", loggingMiddleware(mux.ServeHTTP)); err != nil {
 		log.Fatal(err)
 	}
 }
