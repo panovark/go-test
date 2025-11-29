@@ -7,6 +7,7 @@ USERNAME="maksym.koval"
 # Consider using environment variables or a secrets manager in production.
 PASSWORD="KsVpgRQsXea3CSyCDulU" 
 PROJECT="nuclear-elephants/galactic-energy-exchange"
+PLATFORMS=${PLATFORMS:-"linux/amd64,linux/arm64"} # Set to "linux/amd64" to force only AMD64
 
 # Accepts version as the first argument, defaults to "v1" if not provided
 TAG=${1:-"v1"} 
@@ -29,23 +30,21 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# 2. Docker Build
-echo "2. Building image..."
-sudo docker build -t "$FULL_IMAGE_NAME" .
-
-# Check if build succeeded
-if [ $? -ne 0 ]; then
-    echo "Error: Docker build failed."
-    exit 1
+# 2. Ensure buildx builder (needed for multi-arch)
+echo "2. Ensuring buildx builder..."
+if ! sudo docker buildx inspect multiarch-builder >/dev/null 2>&1; then
+    sudo docker buildx create --name multiarch-builder --use
+else
+    sudo docker buildx use multiarch-builder
 fi
 
-# 3. Docker Push
-echo "3. Pushing image..."
-sudo docker push "$FULL_IMAGE_NAME"
+# 3. Docker Build + Push (multi-arch)
+echo "3. Building and pushing image for platforms: $PLATFORMS ..."
+sudo docker buildx build --platform "$PLATFORMS" -t "$FULL_IMAGE_NAME" --push .
 
-# Check if push succeeded
+# Check if build+push succeeded
 if [ $? -ne 0 ]; then
-    echo "Error: Docker push failed."
+    echo "Error: Docker build/push failed."
     exit 1
 fi
 
