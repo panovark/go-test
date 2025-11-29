@@ -33,18 +33,18 @@ func TestOrdersV2Get_OrderBookSortingAndFilters(t *testing.T) {
 	const end = start + 3600000
 
 	// Valid V2 orders for the contract
-	addOrder(&Order{ID: "bid-old-high", Version: 2, Status: "OPEN", Side: "buy", Price: 200, Quantity: 10, DeliveryStart: start, DeliveryEnd: end, Timestamp: 1})
-	addOrder(&Order{ID: "bid-new-high", Version: 2, Status: "OPEN", Side: "buy", Price: 200, Quantity: 20, DeliveryStart: start, DeliveryEnd: end, Timestamp: 2})
-	addOrder(&Order{ID: "bid-lower", Version: 2, Status: "OPEN", Side: "buy", Price: 150, Quantity: 30, DeliveryStart: start, DeliveryEnd: end, Timestamp: 3})
+	addOrder(&Order{ID: "bid-old-high", Version: 2, Status: "ACTIVE", Side: "buy", Price: 200, Quantity: 10, DeliveryStart: start, DeliveryEnd: end, Timestamp: 1})
+	addOrder(&Order{ID: "bid-new-high", Version: 2, Status: "ACTIVE", Side: "buy", Price: 200, Quantity: 20, DeliveryStart: start, DeliveryEnd: end, Timestamp: 2})
+	addOrder(&Order{ID: "bid-lower", Version: 2, Status: "ACTIVE", Side: "buy", Price: 150, Quantity: 30, DeliveryStart: start, DeliveryEnd: end, Timestamp: 3})
 
-	addOrder(&Order{ID: "ask-old-low", Version: 2, Status: "OPEN", Side: "sell", Price: 40, Quantity: 5, DeliveryStart: start, DeliveryEnd: end, Timestamp: 1})
-	addOrder(&Order{ID: "ask-new-low", Version: 2, Status: "OPEN", Side: "sell", Price: 40, Quantity: 6, DeliveryStart: start, DeliveryEnd: end, Timestamp: 2})
-	addOrder(&Order{ID: "ask-higher", Version: 2, Status: "OPEN", Side: "sell", Price: 60, Quantity: 7, DeliveryStart: start, DeliveryEnd: end, Timestamp: 3})
+	addOrder(&Order{ID: "ask-old-low", Version: 2, Status: "ACTIVE", Side: "sell", Price: 40, Quantity: 5, DeliveryStart: start, DeliveryEnd: end, Timestamp: 1})
+	addOrder(&Order{ID: "ask-new-low", Version: 2, Status: "ACTIVE", Side: "sell", Price: 40, Quantity: 6, DeliveryStart: start, DeliveryEnd: end, Timestamp: 2})
+	addOrder(&Order{ID: "ask-higher", Version: 2, Status: "ACTIVE", Side: "sell", Price: 60, Quantity: 7, DeliveryStart: start, DeliveryEnd: end, Timestamp: 3})
 
 	// Should be filtered out: wrong version, wrong status, wrong contract
 	addOrder(&Order{ID: "v1-order", Version: 1, Status: "OPEN", Side: "buy", Price: 999, Quantity: 1, DeliveryStart: start, DeliveryEnd: end, Timestamp: 10})
 	addOrder(&Order{ID: "closed-v2", Version: 2, Status: "FILLED", Side: "sell", Price: 5, Quantity: 5, DeliveryStart: start, DeliveryEnd: end, Timestamp: 11})
-	addOrder(&Order{ID: "wrong-contract", Version: 2, Status: "OPEN", Side: "buy", Price: 5, Quantity: 5, DeliveryStart: start + 7200000, DeliveryEnd: end + 7200000, Timestamp: 12})
+	addOrder(&Order{ID: "wrong-contract", Version: 2, Status: "ACTIVE", Side: "buy", Price: 5, Quantity: 5, DeliveryStart: start + 7200000, DeliveryEnd: end + 7200000, Timestamp: 12})
 
 	req := httptest.NewRequest(http.MethodGet, "/v2/orders", nil)
 	q := url.Values{}
@@ -135,15 +135,15 @@ func TestModifyOrder_PriorityAndMatching(t *testing.T) {
 	tokens["tok1"] = "user1"
 	users["user2"] = User{Username: "user2", Password: "pw"}
 	tokens["tok2"] = "user2"
-	
+
 	// Existing sell order
 	orders["sell1"] = &Order{
-		ID: "sell1", Version: 2, Status: "OPEN", Side: "sell", Price: 100, Quantity: 10,
+		ID: "sell1", Version: 2, Status: "ACTIVE", Side: "sell", Price: 100, Quantity: 10,
 		DeliveryStart: start, DeliveryEnd: end, Owner: "user2", Timestamp: 1000,
 	}
-	// Existing buy order (resting)
+	// Existing buy order (resting, too low price)
 	orders["buy1"] = &Order{
-		ID: "buy1", Version: 2, Status: "OPEN", Side: "buy", Price: 90, Quantity: 10,
+		ID: "buy1", Version: 2, Status: "ACTIVE", Side: "buy", Price: 90, Quantity: 10,
 		DeliveryStart: start, DeliveryEnd: end, Owner: "user1", Timestamp: 2000,
 	}
 	mu.Unlock()
@@ -151,11 +151,11 @@ func TestModifyOrder_PriorityAndMatching(t *testing.T) {
 	// 2. Modify buy1 price to 100 -> Should match sell1
 	reqBody := map[string]GValue{"price": int64(100), "quantity": int64(10)}
 	encoded, _ := EncodeMessage(reqBody)
-	
+
 	req := httptest.NewRequest(http.MethodPut, "/v2/orders/buy1", bytes.NewReader(encoded))
 	req.Header.Set("Authorization", "Bearer tok1")
 	rr := httptest.NewRecorder()
-	
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v2/orders/", orderOperationHandler)
 	mux.ServeHTTP(rr, req)
@@ -185,7 +185,7 @@ func TestModifyOrder_PriorityReset(t *testing.T) {
 	tokens["tok"] = "u"
 	// Order with old timestamp
 	orders["o1"] = &Order{
-		ID: "o1", Version: 2, Status: "OPEN", Side: "buy", Price: 100, Quantity: 10,
+		ID: "o1", Version: 2, Status: "ACTIVE", Side: "buy", Price: 100, Quantity: 10,
 		DeliveryStart: start, DeliveryEnd: end, Owner: "u", Timestamp: 1000,
 	}
 	mu.Unlock()
@@ -241,7 +241,7 @@ func TestCancelOrder(t *testing.T) {
 	users["u"] = User{Username: "u", Password: "p"}
 	tokens["tok"] = "u"
 	orders["o1"] = &Order{
-		ID: "o1", Version: 2, Status: "OPEN", Side: "buy", Price: 100, Quantity: 10, Owner: "u",
+		ID: "o1", Version: 2, Status: "ACTIVE", Side: "buy", Price: 100, Quantity: 10, Owner: "u",
 	}
 	mu.Unlock()
 
